@@ -1,7 +1,6 @@
 import json
 import logging
 import uuid
-
 from datetime import datetime
 from pathlib import Path
 
@@ -17,16 +16,50 @@ from tools.screen import capture_screen
 
 
 # --------------------------------------------------
-# CONFIGURAZIONE
+# CONFIGURAZIONE MODIFICABILE
 # --------------------------------------------------
+
+# Scrivi qui il prompt da eseguire automaticamente.
+# Se lasci la stringa vuota (""), il programma te lo chiederà
+# nel terminale quando lo avvii.
+
+DEFAULT_INSTRUCTION = "Crea sul Desktop una cartella chiamata PROVA_GUI_AGENT."
 
 MAX_ITERATIONS = 30
 MAX_RECENT_ACTIONS = 10
 
-Path("logs").mkdir(exist_ok=True)
+# DEBUG:
+# True  = mostra decisioni, parametri, risultati ed errori
+# False = disattiva i messaggi di debug aggiuntivi
+
+DEBUG = True
+
+# Screenshot:
+# True = salva uno screenshot quando si verifica un errore
+# False = non salva screenshot in caso di errore
+
+SAVE_SCREENSHOTS_ON_ERROR = True
+
+# True = salva uno screenshot prima di ogni decisione
+# Attenzione: può occupare molto spazio nel tempo.
+
+SAVE_SCREENSHOTS_EACH_STEP = False
+
+
+# --------------------------------------------------
+# CARTELLE E LOG
+# --------------------------------------------------
+
+LOG_DIR = Path("logs")
+TASK_LOG_DIR = LOG_DIR / "tasks"
+SCREENSHOT_DIR = LOG_DIR / "screenshots"
+
+LOG_DIR.mkdir(exist_ok=True)
+TASK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
-    filename="logs/gui_agent.log",
+    filename=str(LOG_DIR / "gui_agent.log"),
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -35,23 +68,160 @@ logger = logging.getLogger("GUI_AGENT")
 
 
 # --------------------------------------------------
+# GESTIONE REPORT JSON
+# --------------------------------------------------
+
+class TaskLogger:
+
+    def __init__(self, task_id, instruction):
+
+        self.task_id = task_id
+        self.instruction = instruction
+
+        self.started_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+
+        self.events = []
+        self.status = "running"
+        self.result = None
+
+    def event(self, event_name, **details):
+
+        entry = {
+            "timestamp": datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "event": event_name,
+            **details
+        }
+
+        self.events.append(entry)
+
+        logger.info(
+            json.dumps(
+                entry,
+                ensure_ascii=False,
+                default=str
+            )
+        )
+
+        if DEBUG:
+
+            print(f"\n[DEBUG] {event_name}")
+
+            if details:
+                print(
+                    json.dumps(
+                        details,
+                        indent=2,
+                        ensure_ascii=False,
+                        default=str
+                    )
+                )
+
+    def finish(self, status, result):
+
+        self.status = status
+        self.result = result
+
+        self.finished_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+
+        self.save()
+
+    def save(self):
+
+        report = {
+            "task_id": self.task_id,
+            "instruction": self.instruction,
+            "started_at": self.started_at,
+            "finished_at": getattr(self, "finished_at", None),
+            "status": self.status,
+            "result": self.result,
+            "events": self.events
+        }
+
+        path = TASK_LOG_DIR / f"task_{self.task_id}.json"
+
+        path.write_text(
+            json.dumps(
+                report,
+                indent=2,
+                ensure_ascii=False,
+                default=str
+            ),
+            encoding="utf-8"
+        )
+
+
+# --------------------------------------------------
+# SCREENSHOT
+# --------------------------------------------------
+
+def save_screenshot(screenshot, task_id, label):
+
+    if not isinstance(screenshot, dict):
+        return None
+
+    image = screenshot.get("image")
+
+    if image is None:
+        return None
+
+    safe_label = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in label
+    )
+
+    timestamp = datetime.now().strftime("%H%M%S_%f")
+
+    folder = SCREENSHOT_DIR / task_id
+    folder.mkdir(parents=True, exist_ok=True)
+
+    path = folder / f"{timestamp}_{safe_label}.png"
+
+    image.save(path)
+
+    return str(path)
+
+
+def debug_print(message, data=None):
+
+    if not DEBUG:
+        return
+
+    print(f"\n[DEBUG] {message}")
+
+    if data is not None:
+
+        print(
+            json.dumps(
+                data,
+                indent=2,
+                ensure_ascii=False,
+                default=str
+            )
+        )
+
+
+# --------------------------------------------------
 # FUNZIONI DI SUPPORTO
 # --------------------------------------------------
 
-def save_log(data):
-    logger.info(json.dumps(data, ensure_ascii=False, default=str))
-
-
 def extract_json(content):
+
     if not isinstance(content, str) or not content.strip():
         raise ValueError("La risposta del modello è vuota")
 
     content = content.strip()
 
     if content.startswith("```"):
+
         lines = content.splitlines()
 
-        if lines[-1].strip() == "```":
+        if lines and lines[-1].strip() == "```":
             lines = lines[1:-1]
         else:
             lines = lines[1:]
@@ -59,18 +229,24 @@ def extract_json(content):
         content = "\n".join(lines).strip()
 
     try:
+
         return json.loads(content)
+
     except json.JSONDecodeError as exc:
+
         raise ValueError(
             f"Il modello non ha restituito JSON valido: {exc}"
         ) from exc
 
 
 def show_plan(plan):
+
     print("\n========== PIANO ==========")
+
     print("Obiettivo:", plan["goal"])
 
     for index, step in enumerate(plan["steps"], start=1):
+
         print(
             f'{index}. {step["action"]}: '
             f'{step["description"]}'
@@ -79,18 +255,24 @@ def show_plan(plan):
     print("===========================\n")
 
 
+# --------------------------------------------------
+# VERIFICA FINALE DEL TASK
+# --------------------------------------------------
+
 def verify_plan_criteria(plan, screenshot):
+
     """
     Chiede al modello visivo di valutare i criteri
     sullo screenshot corrente.
 
-    Un criterio è verificato solo se il modello restituisce
-    esplicitamente true.
+    Un criterio è verificato solo se il modello
+    restituisce esplicitamente true.
     """
 
     criteria = plan["success_criteria"]
 
     if not criteria:
+
         return {
             "completed": False,
             "reason": "Il piano non contiene criteri di successo",
@@ -100,7 +282,10 @@ def verify_plan_criteria(plan, screenshot):
     image_base64 = screenshot.get("image_base64")
 
     if not isinstance(image_base64, str) or not image_base64:
-        raise ValueError("Immagine necessaria per la verifica mancante")
+
+        raise ValueError(
+            "Immagine necessaria per la verifica mancante"
+        )
 
     prompt = f"""
 Sei il Verificatore visivo di un GUI Agent.
@@ -164,16 +349,17 @@ Restituisci esclusivamente JSON valido nel formato:
     criterion_results = result.get("criterion_results")
 
     if not isinstance(criterion_results, dict):
+
         raise ValueError(
             "La verifica non contiene criterion_results validi"
         )
 
-    # Costruiamo un risultato controllato:
-    # criteri mancanti o con valori non booleani diventano False.
     checked_results = {}
 
     for criterion in criteria:
+
         value = criterion_results.get(criterion)
+
         checked_results[criterion] = value is True
 
     completion = verify_task_completion(
@@ -184,7 +370,10 @@ Restituisci esclusivamente JSON valido nel formato:
     return {
         **completion,
         "criterion_results": checked_results,
-        "reason": result.get("reason", completion["reason"])
+        "reason": result.get(
+            "reason",
+            completion["reason"]
+        )
     }
 
 
@@ -196,35 +385,132 @@ def run_task(instruction):
 
     task_id = str(uuid.uuid4())
 
+    task_log = TaskLogger(
+        task_id,
+        instruction
+    )
+
     print("\nAvvio GUI Agent...")
     print("Task ID:", task_id)
 
-    save_log({
-        "event": "task_started",
-        "task_id": task_id,
-        "instruction": instruction
-    })
+    task_log.event(
+        "task_started",
+        instruction=instruction
+    )
+
+    try:
+
+        result = _run_task_loop(
+            instruction,
+            task_id,
+            task_log
+        )
+
+        if task_log.result is None:
+
+            task_log.result = result
+
+            task_log.status = result.get(
+                "status",
+                "finished"
+            )
+
+        return result
+
+    except KeyboardInterrupt:
+
+        result = {
+            "success": False,
+            "status": "interrupted",
+            "task_id": task_id
+        }
+
+        task_log.status = "interrupted"
+        task_log.result = result
+
+        task_log.event("task_interrupted")
+
+        return result
+
+    except Exception as exc:
+
+        logger.exception(
+            "Errore generale durante il task"
+        )
+
+        result = {
+            "success": False,
+            "status": "error",
+            "task_id": task_id,
+            "error": str(exc)
+        }
+
+        task_log.status = "error"
+        task_log.result = result
+
+        task_log.event(
+            "task_error",
+            error=str(exc)
+        )
+
+        return result
+
+    finally:
+
+        task_log.finish(
+            task_log.status,
+            task_log.result
+        )
+
+
+# --------------------------------------------------
+# CICLO AUTONOMO
+# --------------------------------------------------
+
+def _run_task_loop(instruction, task_id, task_log):
 
     # 1. PLANNER
 
     print("\n[PLANNER] Creazione del piano...")
 
+    task_log.event("planner_started")
+
     plan = create_plan(instruction)
 
+    task_log.event(
+        "plan_created",
+        plan=plan
+    )
+
     if plan["needs_clarification"]:
+
         question = plan["clarification_question"]
 
         print("\n[PLANNER] Serve un chiarimento:")
         print(question)
 
-        return {
+        result = {
             "success": False,
             "status": "needs_clarification",
             "question": question,
             "task_id": task_id
         }
 
-    task_state = build_task_state(instruction, plan)
+        task_log.status = "needs_clarification"
+        task_log.result = result
+
+        task_log.event(
+            "clarification_requested",
+            question=question
+        )
+
+        return result
+
+    task_state = build_task_state(
+        instruction,
+        plan
+    )
+
     task_state.task_id = task_id
     task_state.status = "running"
 
@@ -232,19 +518,35 @@ def run_task(instruction):
 
     recent_actions = []
 
-    # 2. CICLO AUTONOMO
+    # 2. CICLO DEL CONTROLLER
 
     for iteration in range(1, MAX_ITERATIONS + 1):
 
-        print(f"\n========== ITERAZIONE {iteration} ==========")
+        print(
+            f"\n========== ITERAZIONE {iteration} =========="
+        )
 
-        # Acquisizione screenshot
+        # SCREENSHOT
 
         print("[SCREEN] Acquisizione dello schermo...")
 
         screenshot = capture_screen()
 
-        # Controller
+        if SAVE_SCREENSHOTS_EACH_STEP:
+
+            path = save_screenshot(
+                screenshot,
+                task_id,
+                f"iteration_{iteration}_before"
+            )
+
+            task_log.event(
+                "screenshot_saved",
+                path=path,
+                iteration=iteration
+            )
+
+        # CONTROLLER
 
         print("[CONTROLLER] Analisi della GUI...")
 
@@ -259,19 +561,29 @@ def run_task(instruction):
         action = decision["action"]
         parameters = decision["parameters"]
 
-        print("[CONTROLLER] Azione scelta:", action)
-        print("[CONTROLLER] Motivo:", decision["short_reason"])
+        print(
+            "[CONTROLLER] Azione scelta:",
+            action
+        )
 
-        save_log({
-            "event": "controller_decision",
-            "task_id": task_id,
-            "iteration": iteration,
-            "decision": decision
-        })
+        print(
+            "[CONTROLLER] Motivo:",
+            decision["short_reason"]
+        )
 
-        # Richiesta di chiarimento
+        task_log.event(
+            "controller_decision",
+            iteration=iteration,
+            action=action,
+            parameters=parameters,
+            short_reason=decision["short_reason"],
+            decision=decision
+        )
+
+        # RICHIESTA DI CHIARIMENTO
 
         if decision["needs_clarification"]:
+
             question = decision["clarification_question"]
 
             print("\n[AGENT] Serve un chiarimento:")
@@ -279,33 +591,61 @@ def run_task(instruction):
 
             task_state.status = "needs_clarification"
 
-            return {
+            result = {
                 "success": False,
                 "status": "needs_clarification",
                 "question": question,
                 "task_id": task_id
             }
 
-        # 3. VERIFICA DEL TASK
+            task_log.status = "needs_clarification"
+            task_log.result = result
+
+            task_log.event(
+                "clarification_requested",
+                question=question
+            )
+
+            return result
+
+        # 3. VERIFICA FINALE
 
         if action == "verify":
 
-            print("[VERIFIER] Verifica visiva dei criteri...")
+            print(
+                "[VERIFIER] Verifica visiva dei criteri..."
+            )
 
             try:
+
                 result = verify_plan_criteria(
                     plan=plan,
                     screenshot=screenshot
                 )
 
             except Exception as exc:
-                print("[VERIFIER] Errore durante la verifica:", exc)
 
-                save_log({
-                    "event": "verification_error",
-                    "task_id": task_id,
-                    "error": str(exc)
-                })
+                print(
+                    "[VERIFIER] Errore durante la verifica:",
+                    exc
+                )
+
+                screenshot_path = None
+
+                if SAVE_SCREENSHOTS_ON_ERROR:
+
+                    screenshot_path = save_screenshot(
+                        screenshot,
+                        task_id,
+                        f"iteration_{iteration}_verification_error"
+                    )
+
+                task_log.event(
+                    "verification_error",
+                    iteration=iteration,
+                    error=str(exc),
+                    screenshot=screenshot_path
+                )
 
                 recent_actions.append({
                     "action": "verify",
@@ -313,39 +653,52 @@ def run_task(instruction):
                     "error": str(exc)
                 })
 
-                recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
+                recent_actions = recent_actions[
+                    -MAX_RECENT_ACTIONS:
+                ]
+
                 continue
 
-            print("[VERIFIER] Risultato:", result)
+            print(
+                "[VERIFIER] Risultato:",
+                result
+            )
 
-            save_log({
-                "event": "task_verification",
-                "task_id": task_id,
-                "result": result
-            })
+            task_log.event(
+                "task_verification",
+                iteration=iteration,
+                result=result
+            )
 
             if result["completed"]:
 
                 task_state.status = "completed"
+
                 task_state.completed_at = datetime.now().isoformat()
 
                 for step in task_state.steps:
                     step.status = "completed"
 
-                print("\n[AGENT] Task completato e verificato.")
+                print(
+                    "\n[AGENT] Task completato e verificato."
+                )
 
-                save_log({
-                    "event": "task_completed",
-                    "task_id": task_id,
-                    "result": result
-                })
-
-                return {
+                final_result = {
                     "success": True,
                     "status": "completed",
                     "task_id": task_id,
                     "verification": result
                 }
+
+                task_log.status = "completed"
+                task_log.result = final_result
+
+                task_log.event(
+                    "task_completed",
+                    verification=result
+                )
+
+                return final_result
 
             print(
                 "[VERIFIER] Completamento non confermato. "
@@ -358,19 +711,30 @@ def run_task(instruction):
                 "verification": result
             })
 
-            recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
+            recent_actions = recent_actions[
+                -MAX_RECENT_ACTIONS:
+            ]
+
             continue
 
         # 4. EXECUTOR
 
-        print("[EXECUTOR] Esecuzione dell'azione...")
+        print(
+            "[EXECUTOR] Esecuzione dell'azione..."
+        )
 
         try:
-            execution_result = execute_action(decision)
+
+            execution_result = execute_action(
+                decision
+            )
 
         except Exception as exc:
 
-            print("[EXECUTOR] Errore:", exc)
+            print(
+                "[EXECUTOR] Errore:",
+                exc
+            )
 
             verification = verify_action(
                 decision=decision,
@@ -380,25 +744,43 @@ def run_task(instruction):
                 }
             )
 
+            screenshot_path = None
+
+            if SAVE_SCREENSHOTS_ON_ERROR:
+
+                screenshot_path = save_screenshot(
+                    screenshot,
+                    task_id,
+                    f"iteration_{iteration}_action_error"
+                )
+
+            task_log.event(
+                "execution_error",
+                iteration=iteration,
+                action=action,
+                parameters=parameters,
+                error=str(exc),
+                verification=verification,
+                screenshot=screenshot_path
+            )
+
             recent_actions.append({
                 "action": action,
                 "parameters": parameters,
-                "verification": verification
+                "result": "error",
+                "error": str(exc)
             })
 
-            recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
-
-            save_log({
-                "event": "execution_error",
-                "task_id": task_id,
-                "action": action,
-                "error": str(exc),
-                "verification": verification
-            })
+            recent_actions = recent_actions[
+                -MAX_RECENT_ACTIONS:
+            ]
 
             continue
 
-        print("[EXECUTOR] Risultato:", execution_result)
+        print(
+            "[EXECUTOR] Risultato:",
+            execution_result
+        )
 
         # 5. VERIFIER DELL'AZIONE
 
@@ -408,7 +790,19 @@ def run_task(instruction):
             observation=None
         )
 
-        print("[VERIFIER] Stato:", verification["status"])
+        print(
+            "[VERIFIER] Stato:",
+            verification["status"]
+        )
+
+        task_log.event(
+            "action_executed",
+            iteration=iteration,
+            action=action,
+            parameters=parameters,
+            execution_result=execution_result,
+            verification=verification
+        )
 
         recent_actions.append({
             "action": action,
@@ -418,34 +812,37 @@ def run_task(instruction):
             "reason": verification["reason"]
         })
 
-        recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
-
-        save_log({
-            "event": "action_verification",
-            "task_id": task_id,
-            "action": action,
-            "execution_result": execution_result,
-            "verification": verification
-        })
+        recent_actions = recent_actions[
+            -MAX_RECENT_ACTIONS:
+        ]
 
     # 6. LIMITE ITERAZIONI
 
     task_state.status = "failed"
-    task_state.error = "Limite massimo di iterazioni raggiunto"
 
-    print("\n[AGENT] Limite massimo di iterazioni raggiunto.")
+    task_state.error = (
+        "Limite massimo di iterazioni raggiunto"
+    )
 
-    save_log({
-        "event": "iteration_limit_reached",
-        "task_id": task_id,
-        "iterations": MAX_ITERATIONS
-    })
+    print(
+        "\n[AGENT] Limite massimo di iterazioni raggiunto."
+    )
 
-    return {
+    result = {
         "success": False,
         "status": "iteration_limit",
         "task_id": task_id
     }
+
+    task_log.status = "iteration_limit"
+    task_log.result = result
+
+    task_log.event(
+        "iteration_limit_reached",
+        iterations=MAX_ITERATIONS
+    )
+
+    return result
 
 
 # --------------------------------------------------
@@ -455,31 +852,60 @@ def run_task(instruction):
 def main():
 
     try:
+
         validate_config()
 
         print("\n================================")
         print("           GUI AGENT")
         print("================================")
 
-        instruction = input(
-            "\nCosa vuoi che faccia il computer?\n> "
-        ).strip()
+        # Se DEFAULT_INSTRUCTION contiene testo,
+        # usa direttamente quel prompt.
+        #
+        # Se è vuoto, chiede il prompt nel terminale.
+
+        if DEFAULT_INSTRUCTION.strip():
+
+            instruction = DEFAULT_INSTRUCTION.strip()
+
+            print("\nPrompt preimpostato nel main.py:")
+            print(">", instruction)
+
+        else:
+
+            instruction = input(
+                "\nCosa vuoi che faccia il computer?\n> "
+            ).strip()
 
         if not instruction:
-            print("Istruzione vuota.")
+
+            print("Istruzione vuota. Nessun task avviato.")
             return
 
         result = run_task(instruction)
 
         print("\n========== RISULTATO ==========")
-        print(json.dumps(result, indent=4, ensure_ascii=False))
+
+        print(
+            json.dumps(
+                result,
+                indent=4,
+                ensure_ascii=False
+            )
+        )
+
         print("================================")
 
     except KeyboardInterrupt:
-        print("\n[AGENT] Interruzione richiesta dall'utente.")
+
+        print(
+            "\n[AGENT] Interruzione richiesta dall'utente."
+        )
 
     except Exception as exc:
+
         logger.exception("Errore generale")
+
         print("\n[ERRORE]", exc)
 
 
