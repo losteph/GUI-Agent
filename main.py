@@ -1,11 +1,12 @@
-
 import json
 import logging
 import uuid
 
 from datetime import datetime
+from pathlib import Path
 
-from config import validate_config
+from config import validate_config, VISION_MODEL
+from llm_client import ask_llm
 
 from agent.planner import create_plan, build_task_state
 from agent.controller import decide_next_action
@@ -20,6 +21,9 @@ from tools.screen import capture_screen
 # --------------------------------------------------
 
 MAX_ITERATIONS = 30
+MAX_RECENT_ACTIONS = 10
+
+Path("logs").mkdir(exist_ok=True)
 
 logging.basicConfig(
     filename="logs/gui_agent.log",
@@ -35,26 +39,153 @@ logger = logging.getLogger("GUI_AGENT")
 # --------------------------------------------------
 
 def save_log(data):
-    """Registra un evento nel log."""
+    logger.info(json.dumps(data, ensure_ascii=False, default=str))
 
-    logger.info(
-        json.dumps(data, ensure_ascii=False, default=str)
-    )
+
+def extract_json(content):
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("La risposta del modello è vuota")
+
+    content = content.strip()
+
+    if content.startswith("```"):
+        lines = content.splitlines()
+
+        if lines[-1].strip() == "```":
+            lines = lines[1:-1]
+        else:
+            lines = lines[1:]
+
+        content = "\n".join(lines).strip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Il modello non ha restituito JSON valido: {exc}"
+        ) from exc
 
 
 def show_plan(plan):
-    """Mostra il piano generato dal Planner."""
-
     print("\n========== PIANO ==========")
     print("Obiettivo:", plan["goal"])
 
-    for step in plan["steps"]:
+    for index, step in enumerate(plan["steps"], start=1):
         print(
-            f'{step["id"] if "id" in step else ""} '
-            f'- {step["action"]}: {step["description"]}'
+            f'{index}. {step["action"]}: '
+            f'{step["description"]}'
         )
 
     print("===========================\n")
+
+
+def verify_plan_criteria(plan, screenshot):
+    """
+    Chiede al modello visivo di valutare i criteri
+    sullo screenshot corrente.
+
+    Un criterio è verificato solo se il modello restituisce
+    esplicitamente true.
+    """
+
+    criteria = plan["success_criteria"]
+
+    if not criteria:
+        return {
+            "completed": False,
+            "reason": "Il piano non contiene criteri di successo",
+            "criterion_results": {}
+        }
+
+    image_base64 = screenshot.get("image_base64")
+
+    if not isinstance(image_base64, str) or not image_base64:
+        raise ValueError("Immagine necessaria per la verifica mancante")
+
+    prompt = f"""
+Sei il Verificatore visivo di un GUI Agent.
+
+Devi controllare esclusivamente ciò che è dimostrabile
+dallo screenshot allegato.
+
+CRITERI DA VERIFICARE:
+{json.dumps(criteria, ensure_ascii=False)}
+
+REGOLE:
+1. Non presumere che un'azione sia riuscita solo perché è stata eseguita.
+2. Non inventare elementi o informazioni non visibili.
+3. Se un criterio non è chiaramente dimostrabile, assegna false.
+4. Valuta ogni criterio separatamente.
+5. Non dichiarare completato il task se anche un solo criterio
+   non è verificato.
+
+Restituisci esclusivamente JSON valido nel formato:
+
+{{
+    "criterion_results": {{
+        "testo esatto del criterio": true
+    }},
+    "reason": "Motivazione sintetica"
+}}
+"""
+
+    response = ask_llm(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": prompt
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Verifica i criteri sullo screenshot."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": (
+                                "data:image/jpeg;base64,"
+                                + image_base64
+                            )
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0,
+        max_tokens=700
+    )
+
+    result = extract_json(response["content"])
+
+    criterion_results = result.get("criterion_results")
+
+    if not isinstance(criterion_results, dict):
+        raise ValueError(
+            "La verifica non contiene criterion_results validi"
+        )
+
+    # Costruiamo un risultato controllato:
+    # criteri mancanti o con valori non booleani diventano False.
+    checked_results = {}
+
+    for criterion in criteria:
+        value = criterion_results.get(criterion)
+        checked_results[criterion] = value is True
+
+    completion = verify_task_completion(
+        success_criteria=criteria,
+        criterion_results=checked_results
+    )
+
+    return {
+        **completion,
+        "criterion_results": checked_results,
+        "reason": result.get("reason", completion["reason"])
+    }
 
 
 # --------------------------------------------------
@@ -82,37 +213,38 @@ def run_task(instruction):
 
     if plan["needs_clarification"]:
         question = plan["clarification_question"]
+
         print("\n[PLANNER] Serve un chiarimento:")
         print(question)
 
         return {
             "success": False,
             "status": "needs_clarification",
-            "question": question
+            "question": question,
+            "task_id": task_id
         }
 
     task_state = build_task_state(instruction, plan)
+    task_state.task_id = task_id
+    task_state.status = "running"
 
     show_plan(plan)
 
     recent_actions = []
-    iteration = 0
 
     # 2. CICLO AUTONOMO
 
-    while iteration < MAX_ITERATIONS:
-
-        iteration += 1
+    for iteration in range(1, MAX_ITERATIONS + 1):
 
         print(f"\n========== ITERAZIONE {iteration} ==========")
 
-        # Acquisizione dello screenshot
+        # Acquisizione screenshot
 
         print("[SCREEN] Acquisizione dello schermo...")
 
         screenshot = capture_screen()
 
-        # Controller: decide la prossima azione
+        # Controller
 
         print("[CONTROLLER] Analisi della GUI...")
 
@@ -137,7 +269,7 @@ def run_task(instruction):
             "decision": decision
         })
 
-        # Gestione chiarimenti
+        # Richiesta di chiarimento
 
         if decision["needs_clarification"]:
             question = decision["clarification_question"]
@@ -145,59 +277,88 @@ def run_task(instruction):
             print("\n[AGENT] Serve un chiarimento:")
             print(question)
 
+            task_state.status = "needs_clarification"
+
             return {
                 "success": False,
                 "status": "needs_clarification",
-                "question": question
+                "question": question,
+                "task_id": task_id
             }
 
-        # 3. RICHIESTA DI VERIFICA
+        # 3. VERIFICA DEL TASK
 
         if action == "verify":
 
-            print("[VERIFIER] Richiesta di verifica...")
+            print("[VERIFIER] Verifica visiva dei criteri...")
 
-            criteria = plan["success_criteria"]
+            try:
+                result = verify_plan_criteria(
+                    plan=plan,
+                    screenshot=screenshot
+                )
 
-            print(
-                "[VERIFIER] I criteri di successo richiedono "
-                "una verifica indipendente."
-            )
+            except Exception as exc:
+                print("[VERIFIER] Errore durante la verifica:", exc)
 
-            result = verify_task_completion(
-                success_criteria=criteria,
-                criterion_results={}
-            )
+                save_log({
+                    "event": "verification_error",
+                    "task_id": task_id,
+                    "error": str(exc)
+                })
 
-            if result.get("verified") is True:
+                recent_actions.append({
+                    "action": "verify",
+                    "result": "verification_error",
+                    "error": str(exc)
+                })
+
+                recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
+                continue
+
+            print("[VERIFIER] Risultato:", result)
+
+            save_log({
+                "event": "task_verification",
+                "task_id": task_id,
+                "result": result
+            })
+
+            if result["completed"]:
+
                 task_state.status = "completed"
                 task_state.completed_at = datetime.now().isoformat()
+
+                for step in task_state.steps:
+                    step.status = "completed"
+
+                print("\n[AGENT] Task completato e verificato.")
+
+                save_log({
+                    "event": "task_completed",
+                    "task_id": task_id,
+                    "result": result
+                })
 
                 return {
                     "success": True,
                     "status": "completed",
-                    "task_id": task_id
+                    "task_id": task_id,
+                    "verification": result
                 }
 
             print(
-                "[VERIFIER] Non ci sono ancora prove sufficienti "
-                "per confermare il completamento."
+                "[VERIFIER] Completamento non confermato. "
+                "Il Controller potrà proseguire."
             )
 
-            save_log({
-                "event": "verification_pending",
-                "task_id": task_id,
-                "criteria": criteria,
-                "result": result
-            })
-
-            # Non dichiariamo il task completato.
-            # Lasciamo al Controller la possibilità di proseguire.
             recent_actions.append({
                 "action": "verify",
-                "result": "verification_pending"
+                "result": "verification_pending",
+                "verification": result
             })
 
+            recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
             continue
 
         # 4. EXECUTOR
@@ -211,31 +372,35 @@ def run_task(instruction):
 
             print("[EXECUTOR] Errore:", exc)
 
+            verification = verify_action(
+                decision=decision,
+                execution_result={
+                    "success": False,
+                    "message": str(exc)
+                }
+            )
+
+            recent_actions.append({
+                "action": action,
+                "parameters": parameters,
+                "verification": verification
+            })
+
+            recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
+
             save_log({
                 "event": "execution_error",
                 "task_id": task_id,
                 "action": action,
-                "error": str(exc)
-            })
-
-            recent_actions.append({
-                "action": action,
-                "result": "error",
-                "error": str(exc)
+                "error": str(exc),
+                "verification": verification
             })
 
             continue
 
         print("[EXECUTOR] Risultato:", execution_result)
 
-        save_log({
-            "event": "action_executed",
-            "task_id": task_id,
-            "action": action,
-            "result": execution_result
-        })
-
-        # 5. VERIFIER
+        # 5. VERIFIER DELL'AZIONE
 
         verification = verify_action(
             decision=decision,
@@ -243,37 +408,27 @@ def run_task(instruction):
             observation=None
         )
 
-        print(
-            "[VERIFIER] Stato:",
-            verification["status"]
-        )
+        print("[VERIFIER] Stato:", verification["status"])
 
         recent_actions.append({
             "action": action,
             "parameters": parameters,
             "execution_result": execution_result,
-            "verification": verification["status"]
+            "verification": verification["status"],
+            "reason": verification["reason"]
         })
+
+        recent_actions = recent_actions[-MAX_RECENT_ACTIONS:]
 
         save_log({
-            "event": "verification",
+            "event": "action_verification",
             "task_id": task_id,
             "action": action,
-            "result": verification
+            "execution_result": execution_result,
+            "verification": verification
         })
 
-        # 6. AGGIORNAMENTO STATO
-
-        if (
-            verification["status"] == "failed"
-            and verification.get("retry") is False
-        ):
-            print("[AGENT] Azione non verificata.")
-
-        # Il Controller rivaluterà lo stato reale
-        # attraverso il prossimo screenshot.
-
-    # 7. LIMITE ITERAZIONI
+    # 6. LIMITE ITERAZIONI
 
     task_state.status = "failed"
     task_state.error = "Limite massimo di iterazioni raggiunto"
@@ -283,7 +438,7 @@ def run_task(instruction):
     save_log({
         "event": "iteration_limit_reached",
         "task_id": task_id,
-        "iterations": iteration
+        "iterations": MAX_ITERATIONS
     })
 
     return {
@@ -303,7 +458,7 @@ def main():
         validate_config()
 
         print("\n================================")
-        print("       GUI AGENT")
+        print("           GUI AGENT")
         print("================================")
 
         instruction = input(
