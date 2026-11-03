@@ -77,3 +77,5 @@ source .venv/bin/activate
 
 python -m pip install openai python-dotenv pydantic pyautogui pillow
 ```
+
+Il progetto per ora operazioni semplici le fa, prossimo passo aggiungere il backtrack per risolvere qualche errorino (tipo nome sbagliao perché stava già un nome scritto e scrive affianco).
