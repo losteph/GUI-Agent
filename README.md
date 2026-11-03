@@ -7,31 +7,31 @@ Non faremo lavorare tre LLM a ogni passaggio. Sarebbe costoso e spesso inutile. 
 
 ## Regole di progettazione per non sprecare API
 
-Non chiamare l'AI per verifiche che Python può fare. Se dobbiamo sapere se un file esiste, usiamo il filesystem, non uno screenshot.
+- Non chiamare l'AI per verifiche che Python può fare. Se dobbiamo sapere se un file esiste, usiamo il filesystem, non uno screenshot.
 
 
 
-Non inviare screenshot inutilmente. Catturiamo lo schermo quando serve prendere una decisione o verificare un cambiamento.
+- Non inviare screenshot inutilmente. Catturiamo lo schermo quando serve prendere una decisione o verificare un cambiamento.
 
 
 
-Non ripetere la stessa richiesta. In caso di errore, registriamo il motivo e cambiamo strategia.
+- Non ripetere la stessa richiesta. In caso di errore, registriamo il motivo e cambiamo strategia.
 
 
 
-Limitare il contesto. Il modello riceve l'obiettivo, lo stato corrente, le ultime azioni e lo screenshot necessario, non tutta la cronologia dall'inizio.
+- Limitare il contesto. Il modello riceve l'obiettivo, lo stato corrente, le ultime azioni e lo screenshot necessario, non tutta la cronologia dall'inizio.
 
 
 
-Usare output strutturati. Il modello deve restituire azioni in un formato JSON validabile, non spiegazioni libere da interpretare.
+- Usare output strutturati. Il modello deve restituire azioni in un formato JSON validabile, non spiegazioni libere da interpretare.
 
 
 
-Imporre limiti di sicurezza. Numero massimo di azioni, timeout, conferma per operazioni distruttive e possibilità di interrompere l'agente.
+- Imporre limiti di sicurezza. Numero massimo di azioni, timeout, conferma per operazioni distruttive e possibilità di interrompere l'agente.
 
 
 
-Registrare i costi. Ogni richiesta deve avere modello, token, tempo, esito e costo, quando il provider comunica questi dati.
+- Registrare i costi. Ogni richiesta deve avere modello, token, tempo, esito e costo, quando il provider comunica questi dati.
 
 > Una cosa importante: il modello non deve poter eseguire codice Python arbitrario. Deve scegliere tra strumenti autorizzati, ad esempio click, double_click, type_text, press_key, screenshot e wait.
 
