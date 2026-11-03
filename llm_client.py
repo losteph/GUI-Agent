@@ -30,9 +30,14 @@ def ask_llm(
         max_tokens=max_tokens
     )
 
+    choice = response.choices[0]
+    message = choice.message
+
     result = {
-        "content": response.choices[0].message.content,
+        "content": message.content,
         "model": response.model,
+        "finish_reason": choice.finish_reason,
+        "refusal": getattr(message, "refusal", None),
         "usage": {
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
