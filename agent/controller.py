@@ -34,6 +34,11 @@ REGOLE:
 12. Non scegliere azioni di alto livello del Planner.
 13. Non dichiarare autonomamente il task completato.
 14. Se ritieni che l'obiettivo sia stato raggiunto, scegli verify.
+15. Interpreta gli elementi della GUI in base alla loro funzione,
+non solo in base al testo visualizzato.
+Ad esempio, "Blank File" può essere l'opzione corretta
+per creare un nuovo file di testo vuoto.
+Dopo averlo creato, assegna il nome e l'estensione richiesti.
 
 AZIONI CONSENTITE:
 
@@ -312,8 +317,36 @@ def decide_next_action(
         max_tokens=700
     )
 
-    decision = extract_json(response["content"])
 
-    validate_decision(decision)
+    if not isinstance(response, dict):
+        raise ValueError(
+            "Risposta LLM non valida: formato inatteso"
+        )
+
+    content = response.get("content")
+
+    if content is None:
+        raise ValueError(
+            "Il modello ha restituito content=None. "
+            f"Modello: {response.get('model')}. "
+            f"Token: {response.get('usage')}"
+        )
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(
+            "Il modello ha restituito una risposta vuota. "
+            f"Modello: {response.get('model')}. "
+            f"Token: {response.get('usage')}"
+        )
+
+    try:
+        decision = extract_json(content)
+        validate_decision(decision)
+
+    except ValueError as error:
+        raise ValueError(
+            f"Risposta del Controller non utilizzabile: {error}. "
+            f"Contenuto ricevuto: {content[:500]}"
+        ) from error
 
     return decision
